@@ -1,1 +1,1 @@
-worker: python bot.py --headless
+worker: python -u bot.py --headless

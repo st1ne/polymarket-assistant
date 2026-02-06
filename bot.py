@@ -205,7 +205,7 @@ async def bot_loop(
 
     # Wait for feeds to populate
     await asyncio.sleep(5)
-    print("  [BOT] strategy loop started")
+    print("  [BOT] strategy loop started", flush=True)
 
     while True:
         try:
@@ -222,7 +222,8 @@ async def bot_loop(
                 last_period_ts = state.period_start_ts
                 last_snapshot_minute = -1
                 print(f"\n  [BOT] new period: {state.period_start_ts} "
-                      f"| strike={'${:,.2f}'.format(state.strike) if state.strike else '?'}")
+                      f"| strike={'${:,.2f}'.format(state.strike) if state.strike else '?'}",
+                      flush=True)
 
             # ── Settlement check (wait a bit after period ends for oracle) ──
             if pending_settlement_ts > 0:
@@ -237,7 +238,8 @@ async def bot_loop(
                         pnl = bot.trades[-1].pnl or 0
                         print(f"  [BOT] settlement: {result} (${pnl:+.2f}) | "
                               f"cumulative: ${bot.total_pnl:+.2f} | "
-                              f"{bot.wins}W/{bot.losses}L ({bot.win_rate:.0%})")
+                              f"{bot.wins}W/{bot.losses}L ({bot.win_rate:.0%})",
+                              flush=True)
                         pending_settlement_ts = 0
                     elif now > period_end + 120:
                         # Give up after 2 minutes — oracle may not be available
@@ -265,7 +267,8 @@ async def bot_loop(
                 signal = strategy.evaluate(strat_state)
                 if signal:
                     print(f"\n  [BOT] 🎯 SIGNAL: {signal.signal.value} → {signal.side} "
-                          f"@ {signal.entry_price:.3f} | {signal.confidence}")
+                          f"@ {signal.entry_price:.3f} | {signal.confidence}",
+                          flush=True)
 
                     # Execute!
                     up_id = state.pm_up_id
@@ -274,7 +277,8 @@ async def bot_loop(
                         rec = executor.execute(signal, up_id, dn_id)
                         print(f"  [BOT] trade logged: {rec.status} | "
                               f"{rec.side} @ {rec.entry_price:.3f} | "
-                              f"${rec.size_usd:.0f}")
+                              f"${rec.size_usd:.0f}",
+                              flush=True)
                     else:
                         print(f"  [BOT] ⚠ no PM token IDs — signal skipped")
 

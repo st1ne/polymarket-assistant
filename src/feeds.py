@@ -60,7 +60,7 @@ async def binance_feed(symbol: str, kline_iv: str, state: State):
 
     while True:
         try:
-            async with websockets.connect(url, ping_interval=30, ping_timeout=30) as ws:
+            async with websockets.connect(url, ping_interval=30, ping_timeout=30, open_timeout=10) as ws:
                 print(f"  [Binance WS] connected – {symbol}")
                 while True:
                     data   = json.loads(await ws.recv())
@@ -91,7 +91,7 @@ async def binance_feed(symbol: str, kline_iv: str, state: State):
                             state.klines.append(candle)
                             state.klines = state.klines[-config.KLINE_MAX:]
         except Exception as e:
-            print(f"  [Binance WS] disconnected ({e}), reconnecting in 3s…")
+            print(f"  [Binance WS] disconnected ({e}), reconnecting in 3s…", flush=True)
             await asyncio.sleep(3)
 
 
@@ -189,12 +189,23 @@ async def pm_feed(state: State):
         print("  [PM] no tokens for this coin/timeframe – skipped")
         return
 
-    assets = [state.pm_up_id, state.pm_dn_id]
     while True:
         try:
-            async with websockets.connect(config.PM_WS, ping_interval=30, ping_timeout=30) as ws:
+            # Re-read token IDs from state on each reconnect (period_tracker may have updated them)
+            assets = [state.pm_up_id, state.pm_dn_id]
+            if not assets[0]:
+                await asyncio.sleep(5)
+                continue
+
+            async with websockets.connect(
+                config.PM_WS,
+                ping_interval=30,
+                ping_timeout=30,
+                open_timeout=10,
+                close_timeout=5,
+            ) as ws:
                 await ws.send(json.dumps({"assets_ids": assets, "type": "market"}))
-                print("  [PM] connected")
+                print("  [PM] connected", flush=True)
                 while True:
                     raw = json.loads(await ws.recv())
 
@@ -207,8 +218,8 @@ async def pm_feed(state: State):
                             if ch.get("best_ask"):
                                 _pm_set(ch["asset_id"], float(ch["best_ask"]), state)
         except Exception as e:
-            print(f"  [PM] disconnected ({e}), reconnecting in 3s…")
-            await asyncio.sleep(3)
+            print(f"  [PM] disconnected ({e}), reconnecting in 5s…", flush=True)
+            await asyncio.sleep(5)
 
 
 def _pm_apply(asset, asks, state):
