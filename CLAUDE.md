@@ -1,13 +1,13 @@
 # Claude Instructions for Polymarket Assistant
 
-**Last Updated**: February 7, 2026
+**Last Updated**: February 8, 2026 (midnight KST)
 
 ## Project Overview
 
 Real-time crypto trading dashboard + automated trading bot for Polymarket's Up/Down binary option markets. Originally forked from [st1ne/polymarket-assistant](https://github.com/st1ne/polymarket-assistant), extended with:
 - **Fair Value calculator** (Black-Scholes binary option pricing against Chainlink oracle)
-- **Automated trading bot** with combined trend-confirmation + reversal strategy
-- **Comprehensive backtesting suite** (multi-strategy, 168 configs, 9 families)
+- **Automated trading bot** — Momentum Scalp v2 with TP/SL exits (no settlement dependency)
+- **Comprehensive backtesting suite** (1818 scalp configs across 6 families + original 168 settlement configs)
 
 ## Architecture
 
@@ -19,12 +19,13 @@ src/
   feeds.py       – Data feeds (Binance WS/REST, Polymarket WS/REST, oracle strike, period tracker)
   indicators.py  – Technical indicators + fair value math (RSI, MACD, EMA, OBI, CVD, Yang-Zhang vol, binary option pricing)
   dashboard.py   – Rich terminal UI (order book, flow, TA, fair value, signals panels)
-  strategy.py    – Combined trading strategy (trend_confirm + reversal, evaluated at minute 7)
-  execution.py   – Order execution layer (paper trading + live Polymarket CLOB API)
+  strategy.py    – Momentum Scalp v2 strategy (entry at min 5, exit via TP/SL)
+  execution.py   – Order execution layer with TP/SL exit support (paper + live)
 scripts/
   markout.py           – Mark-out analysis on raw trades
-  backtest_momentum.py – Single-strategy momentum backtest
-  backtest_all_strategies.py – Multi-strategy backtest (9 families, 168 configs)
+  backtest_momentum.py – Single-strategy momentum backtest (original, settlement-based)
+  backtest_all_strategies.py – Multi-strategy backtest (9 families, 168 configs, settlement-based)
+  backtest_scalp.py    – Scalping backtest with TP/SL exits (6 families, 1818 configs)
 logs/
   trades_YYYY-MM-DD.jsonl – Daily trade log (auto-created by bot)
 ```
@@ -96,7 +97,17 @@ cd "/Users/spson/Library/Mobile Documents/com~apple~CloudDocs/Projects/Claude/po
 
 # Trading bot — live mode (requires env vars)
 PM_PRIVATE_KEY=0x... PM_FUNDER=0x... ./venv/bin/python3 bot.py --live --size 10
+
+# Headless mode for server deployment (plain stdout, no Rich dashboard)
+python -u bot.py --headless
 ```
+
+### Railway Deployment
+- **Procfile**: `worker: python -u bot.py --headless`
+- `-u` flag = unbuffered stdout (essential for Railway log visibility)
+- `--headless` = plain print statements instead of Rich dashboard, disables PM WebSocket (uses REST poller only)
+- Check logs: `railway logs --tail 50`
+- Redeploy: push to git, Railway auto-deploys
 
 ## Trading Context
 
@@ -108,41 +119,67 @@ The user trades BTC Up/Down 15-minute binary markets on Polymarket.
 
 **Key Insight**: Polymarket resolves using Chainlink BTC/USD oracle, NOT Binance. There's typically a $50-150 basis between Binance and Chainlink prices. The dashboard now uses the actual oracle strike.
 
-## Active Strategy: Combined Trend Confirmation + Reversal
+## Active Strategy: Momentum Scalp v2 (TP/SL Exits)
 
 **Implemented in**: `src/strategy.py` → executed by `bot.py`
 
-**Logic** (evaluated once per period at minute 7):
-1. **REVERSAL** (checked first — higher edge signal):
-   - Compare PM Up price at minute 5 vs minute 7
-   - If the leading side FLIPPED (e.g., Down was winning at min 5, Up is winning at min 7)
-   - Buy the new leader if its price >= 0.60
-   - Backtest: 32 trades, 88% win, +14.7c/trade, rare but high-value
+### Why v2? Post-mortem on v1 (settlement-based)
 
-2. **TREND_CONFIRM** (fallback if no reversal):
-   - At minute 7, if leading side price >= 0.60 AND has been increasing since minute 4
-   - Buy the leading side
-   - Backtest: 182 trades, 87% win, +2.6c/trade, consistent
+v1 (trend_confirm + reversal) held to binary settlement (price resolves to 0 or 1).
+- **Live result**: 7W/12L, -$98.18 over ~18 hours
+- **Root cause**: P&L asymmetry — avg win +$3.12 vs avg loss -$9.15 ($10 trade size)
+- **Breakeven win rate**: 76% (actual was 37%)
+- **Conclusion**: Signal quality didn't matter — the exit mechanism was broken
 
-**Combined backtest** (296 periods, 96h): 214 trades, 86.9% win, +4.4c/trade (maker), t=+1.90
-- Split-half stable: +4.9c H1, +4.0c H2
-- 7-day projection at $10/trade: +$202/wk (95% range: +$42 to +$362)
+### v2 Logic (Momentum Scalp with TP/SL)
 
-**Why not the original Passive Maker strategy**: Mark-out analysis proved passive market-making loses money (adverse selection dominates). The model's directional prediction is less accurate than PM market prices.
+**Entry** (evaluated once per period around minute 5):
+- Buy the leading side if price >= 0.60 AND price trending up from minute 3
+- No reversal sub-signal — just momentum confirmation
+
+**Exit** (checked every 2 seconds while position is open):
+- **Take Profit**: +15¢ above entry → exit immediately
+- **Stop Loss**: -5¢ below entry → exit immediately
+- **Deadline**: exit at market price at minute 14 if neither TP/SL hit
+
+**Parameters**: `ENTRY_MINUTE=5.0, LOOKBACK_MINUTE=3.0, THRESHOLD=0.60, TAKE_PROFIT=0.15, STOP_LOSS=0.05, DEADLINE_MINUTE=14.0`
+
+**Backtest** (96h, 294 periods, config `mom_m5_lb2_60%_tp0.15_sl0.05`):
+- 185 trades, 58% win rate, +5.6¢/trade, t-stat = +8.18
+- Avg win: +13.3¢, Avg loss: -4.9¢ (2.7:1 reward/risk ratio)
+- Breakeven win rate: 27%, actual: 58% → huge edge buffer
+- Split-half: +5.9¢ H1, +5.3¢ H2 (perfectly stable)
+- Profit factor: 3.70
+- Exit breakdown: 39% TP, 41% SL, 20% deadline
 
 ### Bot Architecture (`bot.py`)
 
-**Data flow**: feeds.py (Binance + PM prices) → strategy.py (signal evaluation) → execution.py (order placement)
+**Data flow**: feeds.py (Binance + PM prices) → strategy.py (signal evaluation + exit check) → execution.py (entry/exit)
 
-**Snapshot collection**: Starting at minute 3.5, the bot captures PM Up price every ~30 seconds. These snapshots feed into the strategy evaluator.
+**Snapshot collection**: Starting at minute 2.5, the bot captures PM Up price every ~30 seconds. These snapshots feed into `strategy.evaluate()`.
 
-**Signal → Execution**: When `strategy.evaluate()` fires a signal at ~minute 7, `execution.py` places a maker-only order via Polymarket CLOB API (or logs it in paper mode).
+**Entry**: When `strategy.evaluate()` fires a signal at ~minute 5, `execution.py` places a maker-only order.
 
-**Settlement**: After each period ends (+30s for oracle reporting), the bot queries `past-results` API for the outcome and settles the position.
+**Exit monitoring**: Every 2 seconds, `strategy.check_exit()` compares current PM price against TP/SL/deadline. When triggered, `execution.exit_position()` closes the trade at current market price. No oracle/settlement dependency.
+
+**Fallback**: If somehow a position is still open at period boundary (shouldn't happen with deadline at min 14), it's force-closed at market price.
 
 **Execution modes**:
-- `PaperExecutor`: Logs trades to `logs/trades_YYYY-MM-DD.jsonl`, computes theoretical P&L
-- `LiveExecutor`: Places real orders via `py-clob-client` (requires `PM_PRIVATE_KEY` + `PM_FUNDER` env vars)
+- `PaperExecutor`: Logs trades to `logs/trades_YYYY-MM-DD.jsonl`, computes theoretical P&L based on current PM prices
+- `LiveExecutor`: Places real orders via `py-clob-client` (exit sell orders TBD — requires CLOB sell implementation)
+
+### Other Strategies Tested (Backtest Results)
+
+From `scripts/backtest_scalp.py` (1818 configs, 6 families):
+
+| Family | Best t-stat | Trades | Win% | PnL/trade | Viable? |
+|--------|------------|--------|------|-----------|---------|
+| **momentum_scalp** | **+8.18** | 185 | 58% | +5.6¢ | ✅ **Deployed** |
+| early_cheap | +5.81 | 195 | 37% | +3.6¢ | ✅ Potential |
+| support_resistance | +3.75 | 181 | 36% | +1.8¢ | ✅ Weak |
+| range_bound | +3.44 | 220 | 34% | +1.4¢ | ✅ Weak |
+| mean_reversion | +1.56 | 93 | 31% | +1.0¢ | ⚠️ Marginal |
+| vol_spike | -1.24 | 29 | 10% | -4.2¢ | ❌ Negative |
 
 ### Deprecated: Chainlink-Anchored Passive Maker
 
@@ -230,13 +267,17 @@ Originally planned strategy (from Claude + Codex analysis). **Abandoned** after 
 - **Model calibration**: Systematically overestimates FV(Up). Useful as dashboard indicator, not trading signal.
 - **Regime dependence**: Edge may vary with BTC volatility regime.
 
-### Implementation Priority (revised Feb 7)
+### Implementation Priority (revised Feb 8 midnight)
 1. ~~Mark-out analysis script~~ ✅ DONE
 2. ~~Prices-history momentum backtest~~ ✅ DONE — inconclusive (possible edge, not proven)
 3. ~~Multi-strategy backtest (168 configs)~~ ✅ DONE — combined strategy is best
-4. ~~Build automated bot~~ ✅ DONE — `bot.py` with paper + live modes
-5. **NOW**: Run paper-trade bot 24/7 to validate edge on live data
-6. If validated: switch to live mode with small size ($10/trade)
+4. ~~Build automated bot v1~~ ✅ DONE — deployed to Railway
+5. ~~v1 post-mortem~~ ✅ DONE — 7W/12L (-$98), P&L asymmetry killed it
+6. ~~Scalping backtest (1818 configs, 6 families)~~ ✅ DONE — momentum scalp +5.6¢/trade, t=+8.18
+7. ~~Build + deploy v2 (Momentum Scalp with TP/SL)~~ ✅ DONE — running on Railway
+8. **NOW**: Paper trading validation v2 — monitor 12+ hours
+9. If validated: switch to live mode with small size ($10/trade)
+10. Consider adding early_cheap as secondary strategy (t=+5.81)
 
 ## Volatility Interpretation (annualized Yang-Zhang)
 - **20-35%**: Low vol. FV near 0.50. Little edge.
@@ -247,12 +288,23 @@ Originally planned strategy (from Claude + Codex analysis). **Abandoned** after 
 Note: These buckets are uncalibrated intuition. Need to validate against actual past-results data.
 
 ## Known Issues / Future Work
-- PM WebSocket sometimes returns stale prices at connection time (mitigated by REST poller)
+- **PM WebSocket unreliable on Railway**: Consistent 1011 keepalive ping timeouts every 2-3min. Disabled in headless mode; REST poller (`pm_price_poller`, 10s interval) is the sole PM price source on Railway.
+- **PM REST prices are "sticky"**: Gamma API `outcomePrices` can return the same price for minutes. This affects both entry signals (p5 > p3 check) and TP/SL exit detection. A real 15¢ move may not be captured until minutes later. Consider shorter poll interval or alternative data source.
+- **TP/SL exit detection may lag**: With 10s REST poll interval and sticky prices, a TP or SL exit may be triggered later than optimal. In the worst case, a 5¢ stop loss could become a larger loss if the price moved past -5¢ between polls. The deadline exit at minute 14 provides a hard floor.
+- **Binance WebSocket disconnects on Railway**: Gets 1011 every 2-3min but reconnects instantly (3s delay). Functional but noisy in logs.
 - Only 15m timeframe has full fair value support (oracle strike + period tracking)
 - S uses Binance mid as proxy for live Chainlink price — introduces ~$50-150 basis error
 - Need tracking dashboard: cumulative P&L, rolling win rate, edge at entry vs outcome, profit factor by hour
 - `clob.polymarket.com/prices-history` is the best data source for backtesting (full coverage from min 0, no 4000-trade cap)
 - `data-api.polymarket.com/trades` caps at 4000 trades per market, misses first 3-5 min of each period
+
+### Settlement API Behavior (Critical Knowledge)
+The `polymarket.com/api/past-results` API has specific behavior that caused a critical bug:
+- **Returns results that ended BEFORE `currentEventStartTime`**, not after
+- **~15min reporting delay** — a period that ended at :15 may not appear until :30
+- **Returns only ~3-4 results per query**
+- **Correct approach**: Query with `currentEventStartTime` set to the current period (or later), not the target period + 900s
+- **Implementation**: `fetch_period_outcome()` in `bot.py` tries 3 different timestamps to maximize coverage
 
 ## Corrections Log
 - **Feb 6**: Fixed PM prices showing 0.01/1.00 — added REST fallback poller
@@ -268,3 +320,16 @@ Note: These buckets are uncalibrated intuition. Need to validate against actual 
 - **Feb 6**: Fixed oracle period enumeration bug — was stepping hourly, but past-results API returns ~4 results per query. Changed to 15-minute stepping, finding 89/96 periods per day (93%) vs 45 with hourly stepping.
 - **Feb 6**: Multi-strategy backtest (168 configs, 9 families) showed: mean reversion is terrible (25% win), trend reversal is best single signal (t=+2.34 but rare), trend confirmation is most reliable.
 - **Feb 7**: Built automated trading bot (`bot.py`) with combined strategy, paper/live execution modes, trade logging to `logs/` directory.
+- **Feb 7**: Deployed bot to Railway with `Procfile` (headless mode). Fixed multiple production issues:
+  - PM WebSocket stale token IDs after period change (moved assets read inside reconnect loop)
+  - PM WebSocket not detecting period changes mid-connection (added token ID change detection + recv timeout)
+  - Disabled PM WebSocket in headless mode — REST poller is more reliable on Railway
+  - Python stdout buffering on Railway (`python -u` flag + `flush=True` on critical prints)
+  - Heartbeat logging gaps (changed from modulo arithmetic to time-based tracking)
+  - **CRITICAL**: Settlement timing out 50% of trades — `fetch_period_outcome()` was querying oracle API with `currentEventStartTime = period_start_ts + 900` but the API returns results that ended BEFORE that timestamp with ~15min delay. Fixed by querying multiple timestamps.
+  - Settlement timeout increased from 2min → 10min, verbose logging throttled to every 30s
+  - Oracle strike fetch retry (3 attempts, 2s delay) on period change
+- **Feb 7**: v1 bot post-mortem: 7W/12L, -$98.18. Root cause: P&L asymmetry from settlement-based exits. Avg win +$3.12 vs avg loss -$9.15. Required 76% win rate, got 37%. Signal quality was irrelevant.
+- **Feb 8**: Built scalping backtest (`scripts/backtest_scalp.py`) with `simulate_exit()` function. Tests within-period TP/SL exits instead of settlement. 6 strategy families, 1818 configs across 96h.
+- **Feb 8**: Momentum Scalp dominates — top 25 strategies ALL from this family. Best: t=+8.18, 58% win, +5.6¢/trade, avg win +13.3¢ vs avg loss -4.9¢. Split-half stable (+5.9¢ / +5.3¢).
+- **Feb 8**: Deployed Momentum Scalp v2 to Railway. Strategy enters at min 5 (trending from min 3), exits via TP(+15¢)/SL(-5¢)/deadline(min 14). No settlement dependency.
