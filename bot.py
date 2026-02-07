@@ -366,8 +366,8 @@ async def headless_loop(
                       flush=True)
                 last_heartbeat = now
 
-            # Periodic heartbeat every 60s
-            elif now - last_heartbeat >= 60 and state.period_start_ts > 0:
+            # Periodic heartbeat every 30s
+            elif now - last_heartbeat >= 30 and state.period_start_ts > 0:
                 elapsed = (now - state.period_start_ts) / 60
                 pm_str = f"↑{state.pm_up:.3f} ↓{state.pm_dn:.3f}" if state.pm_up is not None else "?"
                 print(f"[{mode}] min {elapsed:.1f} | PM: {pm_str} | "
@@ -461,7 +461,30 @@ async def main():
     else:
         log("  [PM] WebSocket disabled in headless mode — using REST poller only")
 
-    await asyncio.gather(*tasks)
+    # Run all tasks — if any crashes, log it and restart the whole bot
+    while True:
+        try:
+            await asyncio.gather(*tasks)
+        except Exception as e:
+            print(f"\n  [FATAL] asyncio.gather crashed: {e}", flush=True)
+            print(f"  [FATAL] restarting bot in 10s…", flush=True)
+            import traceback
+            traceback.print_exc()
+            await asyncio.sleep(10)
+
+            # Re-create tasks that may have died
+            tasks = [
+                feeds.ob_poller(binance_sym, state),
+                feeds.binance_feed(binance_sym, kline_iv, state),
+                feeds.pm_price_poller(state, args.coin, tf),
+                feeds.period_tracker(state, args.coin, tf),
+                bot_loop(state, executor, args.coin, strat_state),
+                headless_loop(state, strat_state, executor, args.coin, mode) if args.headless
+                else display_loop(state, strat_state, executor, args.coin, mode),
+            ]
+            if not args.headless:
+                tasks.append(feeds.pm_feed(state))
+            print(f"  [FATAL] restarted {len(tasks)} tasks", flush=True)
 
 
 if __name__ == "__main__":
