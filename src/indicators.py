@@ -220,3 +220,34 @@ def heikin_ashi(klines):
             "green": c >= o,
         })
     return ha
+
+
+# ── Fair value for Up/Down markets ──────────────────────────────
+
+def realized_vol_per_sec(klines):
+    """Std-dev of log returns per √second, from recent closed candles."""
+    import math
+    ks = klines[-(config.VOL_LOOKBACK + 1):]
+    if len(ks) < 10:
+        return None
+    rets = [math.log(ks[i]["c"] / ks[i - 1]["c"]) for i in range(1, len(ks))]
+    dt   = (ks[-1]["t"] - ks[0]["t"]) / (len(ks) - 1)
+    if dt <= 0:
+        return None
+    mu  = sum(rets) / len(rets)
+    var = sum((r - mu) ** 2 for r in rets) / (len(rets) - 1)
+    return math.sqrt(var / dt)
+
+
+def fair_up_prob(price, price_to_beat, secs_left, sigma_per_sec):
+    """P(close ≥ price_to_beat) under a driftless lognormal walk."""
+    import math
+    if not price or not price_to_beat or sigma_per_sec is None:
+        return None
+    if secs_left <= 0:
+        return 1.0 if price >= price_to_beat else 0.0
+    sd = sigma_per_sec * math.sqrt(secs_left)
+    if sd <= 0:
+        return None
+    z = math.log(price / price_to_beat) / sd
+    return 0.5 * (1 + math.erf(z / math.sqrt(2)))

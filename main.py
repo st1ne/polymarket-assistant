@@ -1,6 +1,7 @@
 import sys
 import os
 import asyncio
+import argparse
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
@@ -14,6 +15,7 @@ from rich.live   import Live
 import config
 import feeds
 import dashboard
+import edge_finder
 
 console = Console(force_terminal=True)
 
@@ -43,35 +45,44 @@ async def display_loop(state: feeds.State, coin: str, tf: str):
             await asyncio.sleep(refresh_interval)
 
 
+def parse_args():
+    ap = argparse.ArgumentParser(description="Polymarket crypto dashboard")
+    ap.add_argument("--coin", type=str.upper, choices=config.COINS)
+    ap.add_argument("--tf", choices=sorted({t for v in config.COIN_TIMEFRAMES.values() for t in v}))
+    return ap.parse_args()
+
+
 async def main():
+    args = parse_args()
     console.print("\n[bold magenta]═══ CRYPTO PREDICTION DASHBOARD ═══[/bold magenta]\n")
 
-    coin = pick("Select coin:", config.COINS)
-    tf   = pick("Select timeframe:", config.COIN_TIMEFRAMES[coin])
+    coin = args.coin or pick("Select coin:", config.COINS)
+    tf   = args.tf   or pick("Select timeframe:", config.COIN_TIMEFRAMES[coin])
 
     console.print(f"\n[bold green]Starting {coin} {tf} …[/bold green]\n")
 
-    state = feeds.State()
+    await asyncio.to_thread(feeds.select_binance_endpoint)
 
-    state.pm_up_id, state.pm_dn_id = feeds.fetch_pm_tokens(coin, tf)
-    if state.pm_up_id:
-        console.print(f"  [PM] Up   → {state.pm_up_id[:24]}…")
-        console.print(f"  [PM] Down → {state.pm_dn_id[:24]}…")
-    else:
-        console.print("  [yellow][PM] no market for this coin/timeframe – prices will not show[/yellow]")
-
+    state       = feeds.State()
+    state.resolves_on = config.TF_RESOLVES_ON[tf]
     binance_sym = config.COIN_BINANCE[coin]
     kline_iv    = config.TF_KLINE[tf]
     console.print("  [Binance] bootstrapping candles …")
     await feeds.bootstrap(binance_sym, kline_iv, state)
 
     await asyncio.gather(
+        feeds.market_manager(coin, tf, binance_sym, state),
         feeds.ob_poller(binance_sym, state),
         feeds.binance_feed(binance_sym, kline_iv, state),
         feeds.pm_feed(state),
+        feeds.chainlink_feed(coin, state),
+        edge_finder.run_recorder(state, coin, tf),
         display_loop(state, coin, tf),
     )
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

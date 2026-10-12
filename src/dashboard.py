@@ -4,8 +4,11 @@ from rich.console import Group
 from rich.text    import Text
 from rich         import box as bx
 
+import time
+
 import config
 import indicators as ind
+import edge_finder
 
 
 class _Group:
@@ -112,6 +115,8 @@ def _header(st, coin, tf):
 
     if st.pm_up is not None and st.pm_dn is not None:
         parts.append((f"  PM ↑ {st.pm_up:.3f}  ↓ {st.pm_dn:.3f}  ", "cyan"))
+    elif st.pm_slug:
+        parts.append(("  PM: waiting for book…  ", "dim cyan"))
 
     parts.append((f" {label} ", f"bold white on {col}"))
     parts.append((f"  ({score:+d})", col))
@@ -350,6 +355,71 @@ def _signals_panel(st):
     return Panel("\n".join(sigs), title="SIGNALS", box=bx.ROUNDED, expand=True)
 
 
+def _f(v, d=3):
+    return "—" if v is None else f"{v:.{d}f}"
+
+
+def _market_panel(st, timeframe):
+    t = Table(box=None, show_header=False, pad_edge=False, expand=True)
+    t.add_column("label", style="dim", width=14, no_wrap=True)
+    t.add_column("value", min_width=16, no_wrap=True)
+    t.add_column("note",  ratio=1, overflow="ellipsis", no_wrap=True)
+
+    if not st.pm_slug:
+        t.add_row("Market", "[yellow]no live Polymarket market[/yellow]", "")
+        return Panel(t, title="POLYMARKET WINDOW", box=bx.ROUNDED, expand=True)
+
+    now  = time.time()
+    left = (st.win_end or now) - now
+    mm, ss = divmod(max(0, int(left)), 60)
+    hh, mm = divmod(mm, 60)
+    t.add_row("Market", f"closes in [bold]{hh:d}:{mm:02d}:{ss:02d}[/bold]",
+              f"[cyan]{st.pm_slug}[/cyan]")
+
+    ptb, ref = st.price_to_beat, st.ref_price
+    src = "Chainlink" if st.resolves_on == "chainlink" else "Binance"
+    age = st.ref_age
+    if st.ref_stale:
+        stale = "no tick yet" if age is None else f"{age:.0f}s old"
+        t.add_row("Live price", _p(ref) if ref else "[dim]—[/dim]",
+                  f"[red bold]STALE · {stale} · signals blocked[/red bold]")
+    else:
+        t.add_row("Live price", _p(ref) if ref else "[dim]—[/dim]", f"[dim]{src} · settlement source[/dim]")
+    if ptb and ref:
+        d   = ref - ptb
+        c   = "green" if d >= 0 else "red"
+        t.add_row("Price to beat", _p(ptb),
+                  f"[{c}]{d:+,.2f} ({d / ptb * 100:+.3f}%)[/{c}] [dim]{st.ptb_source}[/dim]")
+    else:
+        note = "window not started" if st.win_start and now < st.win_start else "fetching…"
+        t.add_row("Price to beat", "[dim]—[/dim]", f"[dim]{note}[/dim]")
+
+    t.add_row("UP bid/ask", f"{_f(st.pm_up_bid)} / {_f(st.pm_up)}", "")
+    t.add_row("DOWN bid/ask", f"{_f(st.pm_dn_bid)} / {_f(st.pm_dn)}", "")
+
+    edge = edge_finder.estimate(st, timeframe)
+    p = edge["p_up"]
+    if p is None:
+        t.add_row("Model P(up)", "[dim]—[/dim]", "")
+    else:
+        t.add_row("Model P(up)", f"[bold]{p:.3f}[/bold]",
+                  f"[dim]lognormal, σ {config.VOL_LOOKBACK} candles[/dim]")
+        for name, key in (("Net edge UP", "up_edge"), ("Net edge DOWN", "down_edge")):
+            value = edge[key]
+            if value is None:
+                continue
+            candidate = value >= config.EDGE_MIN_NET
+            c = "green bold" if candidate else "red" if value < 0 else "yellow"
+            note = "RESEARCH SIGNAL" if candidate else "after fee + buffer"
+            t.add_row(name, f"[{c}]{value:+.3f}[/{c}]", f"[{c}]{note}[/{c}]")
+        if edge["up_edge"] is None and edge["down_edge"] is None:
+            t.add_row("Depth check", f"[dim]waiting for {config.EDGE_PROBE_SHARES:g}-share ask depth[/dim]",
+                      f"[dim]VWAP within {config.EDGE_MAX_WALK:.3f} of best ask[/dim]")
+    t.add_row("Forecast score", st.edge_summary, "[dim]read-only ledger[/dim]")
+
+    return Panel(t, title="POLYMARKET WINDOW", box=bx.ROUNDED, expand=True)
+
+
 def render(st, coin, tf) -> "_Group":
     header = _header(st, coin, tf)
 
@@ -361,4 +431,4 @@ def render(st, coin, tf) -> "_Group":
         _flow_panel(st),
     )
 
-    return _Group(header, grid, _signals_panel(st))
+    return _Group(header, _market_panel(st, tf), grid, _signals_panel(st))
